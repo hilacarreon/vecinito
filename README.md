@@ -15,7 +15,6 @@ Vecinito es un asistente inteligente que ayuda a vecinos de **City Bell**, **Gon
 - 🗺️ **Links a Google Maps** — Inyección automática de links en la respuesta
 - 🎙️ **Audio** — Transcripción de notas de voz con Whisper
 - 💬 **Contexto de conversación** — Recuerda el historial de la última hora
-- 🏘️ **Selección de zona** — Botones inline para filtrar por City Bell, Gonnet o Villa Elisa
 - ⚡ **Debouncing** — Agrupa mensajes rápidos y procesa solo la última versión
 - 🛡️ **Rate limiting** — Máximo 10 mensajes por minuto por usuario
 - 🗄️ **Redis** — Persistencia de historiales (2h) y ubicaciones (24h), con fallback a memoria

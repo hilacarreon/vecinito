@@ -8,9 +8,7 @@ CAMBIOS v4:
 - [RAG] Scoring ponderado por campo (nombre>rubro/categoría>tags)
 - [RAG] Matching parcial de palabras (plom→plomero)
 - [RAG] Expansión de query con sinónimos para Supabase también
-- [UX] Pregunta de zona con botones inline si no hay zona ni ubicación
 - [UX] Bienvenida automática al primer mensaje de un usuario nuevo
-- [UX] Callback handler para selección de zona inline
 - [PROMPT] Instrucción de zona en system prompt
 
 Incluye todos los fixes de v3:
@@ -45,12 +43,11 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telegram import (
     Update, KeyboardButton, ReplyKeyboardMarkup,
-    InlineKeyboardButton, InlineKeyboardMarkup,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder, ContextTypes,
-    CommandHandler, MessageHandler, CallbackQueryHandler, filters,
+    CommandHandler, MessageHandler, filters,
 )
 
 # ══════════════════════════════════════════════════════════
@@ -935,41 +932,6 @@ async def transcribir_audio(voice_file, file_size: int | None = None) -> str | N
 
 
 # ══════════════════════════════════════════════════════════
-# BOTONES INLINE DE ZONA                             v4 NEW
-# ══════════════════════════════════════════════════════════
-
-def crear_botones_zona(consulta_original: str) -> InlineKeyboardMarkup:
-    """Crea botones inline para seleccionar zona."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📍 City Bell",   callback_data=f"zona:citybell:{consulta_original[:100]}"),
-            InlineKeyboardButton("📍 Gonnet",      callback_data=f"zona:gonnet:{consulta_original[:100]}"),
-            InlineKeyboardButton("📍 Villa Elisa", callback_data=f"zona:villaelisa:{consulta_original[:100]}"),
-        ],
-        [
-            InlineKeyboardButton("🔍 Todas las zonas", callback_data=f"zona:todas:{consulta_original[:100]}"),
-        ],
-    ])
-
-
-def necesita_pregunta_zona(user_id: str, mensaje: str) -> bool:
-    """
-    Retorna True si deberíamos preguntar la zona al usuario.
-    Condiciones: no tiene ubicación guardada Y no mencionó zona en el mensaje.
-    """
-    if obtener_ubicacion(user_id):
-        return False
-    if detectar_zona(mensaje):
-        return False
-    # No preguntar zona para mensajes de feedback o conversacionales
-    msg_lower = mensaje.lower().strip()
-    NO_PREGUNTAR = {"gracias", "genial", "dale", "otro", "mas", "más", "no", "si", "sí"}
-    if msg_lower in NO_PREGUNTAR or len(msg_lower) < 4:
-        return False
-    return True
-
-
-# ══════════════════════════════════════════════════════════
 # COLA DE MENSAJES — generation counter
 # ══════════════════════════════════════════════════════════
 
@@ -1020,17 +982,6 @@ async def _esperar_y_procesar(user_id: str, generation: int):
 
         # Enviar respuesta
         await responder_seguro(update.message, respuesta, disable_web_page_preview=True)
-
-        # Preguntar zona si corresponde
-        consulta_original = mensajes[0] if len(mensajes) == 1 else mensaje_final
-        if necesita_pregunta_zona(user_id, consulta_original):
-            try:
-                await update.message.reply_text(
-                    "📍 ¿Buscás en alguna zona en particular?",
-                    reply_markup=crear_botones_zona(consulta_original),
-                )
-            except Exception as e:
-                logger.warning(f"Error enviando botones de zona: {e}")
 
     except asyncio.CancelledError:
         pass
@@ -1560,55 +1511,6 @@ async def manejar_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     respuesta = await obtener_respuesta(user_id, texto, skip_log=True)
     await responder_seguro(update.message, respuesta, disable_web_page_preview=True)
 
-    # Pregunta de zona para audios también
-    if necesita_pregunta_zona(user_id, texto):
-        try:
-            await update.message.reply_text(
-                "📍 ¿Buscás en alguna zona en particular?",
-                reply_markup=crear_botones_zona(texto),
-            )
-        except Exception as e:
-            logger.warning(f"Error botones zona (audio): {e}")
-
-
-async def manejar_callback_zona(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler para cuando el usuario toca un botón de zona inline."""
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data  # formato: "zona:{zona}:{consulta_original}"
-    partes = data.split(":", 2)
-    if len(partes) < 3:
-        return
-
-    _, zona_key, consulta_original = partes
-    user_id = str(update.effective_user.id)
-
-    # Mapear zona_key a nombre legible
-    ZONA_MAP = {
-        "citybell":   "City Bell",
-        "gonnet":     "Gonnet",
-        "villaelisa": "Villa Elisa",
-        "todas":       None,
-    }
-    zona = ZONA_MAP.get(zona_key)
-
-    # Editar el mensaje de los botones para mostrar qué eligió
-    if zona:
-        await query.edit_message_text(f"📍 Buscando en *{zona}*...", parse_mode="Markdown")
-    else:
-        await query.edit_message_text("🔍 Buscando en todas las zonas...")
-
-    # Re-ejecutar la búsqueda con la zona seleccionada
-    if zona:
-        mensaje_con_zona = f"{consulta_original} en {zona}"
-    else:
-        mensaje_con_zona = consulta_original
-
-    await query.message.chat.send_action(ChatAction.TYPING)
-    respuesta = await obtener_respuesta(user_id, mensaje_con_zona, skip_log=False)
-    await responder_seguro(query.message, respuesta, disable_web_page_preview=True)
-
 
 async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -1692,7 +1594,6 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(manejar_callback_zona, pattern=r"^zona:"))
     app.add_handler(MessageHandler(filters.LOCATION, manejar_ubicacion))
     app.add_handler(MessageHandler(filters.VOICE, manejar_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_mensaje))
