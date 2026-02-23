@@ -1,18 +1,25 @@
-# 🏘️ Vecinito
+# 🏘️ Vecinito v4
 
-**Bot de Telegram para encontrar comercios locales en el Corredor Norte de La Plata**
+**Bot de Telegram con RAG para encontrar comercios y servicios de la zona**
 
-Vecinito es un asistente virtual que ayuda a vecinos de City Bell, Gonnet y Villa Elisa a encontrar comercios y servicios cerca de ellos.
+Vecinito es un asistente inteligente que ayuda a vecinos de **City Bell**, **Gonnet** y **Villa Elisa** a encontrar comercios y servicios cerca de ellos, usando búsqueda semántica con Supabase + pgvector y GPT-4o-mini.
 
 ---
 
 ## ✨ Características
 
-- 🔍 **Búsqueda inteligente** - Entiende lenguaje natural ("dónde compro carbón para el asado")
-- 📍 **Ordenar por cercanía** - Envía tu ubicación y te muestra los más cercanos
-- 🗺️ **Links a Google Maps** - Cada comercio tiene su ubicación exacta
-- 💬 **Contexto de conversación** - Recuerda lo que hablaste en la última hora
-- 🧠 **Razonamiento** - Si buscás un producto, deduce en qué tipo de comercio encontrarlo
+- 🔍 **Búsqueda semántica (RAG)** — Supabase + pgvector con embeddings de OpenAI
+- 🧠 **Sinónimos inteligentes** — ~150+ mapeos ("pizza" → pizzería, "remedio" → farmacia)
+- 📍 **Ordenar por cercanía** — Envía tu ubicación y ordena por distancia (Haversine)
+- 🕐 **Horarios en tiempo real** — Muestra ABIERTO ✅ / CERRADO ❌ sin depender del LLM
+- 🗺️ **Links a Google Maps** — Inyección automática de links en la respuesta
+- 🎙️ **Audio** — Transcripción de notas de voz con Whisper
+- 💬 **Contexto de conversación** — Recuerda el historial de la última hora
+- 🏘️ **Selección de zona** — Botones inline para filtrar por City Bell, Gonnet o Villa Elisa
+- ⚡ **Debouncing** — Agrupa mensajes rápidos y procesa solo la última versión
+- 🛡️ **Rate limiting** — Máximo 10 mensajes por minuto por usuario
+- 🗄️ **Redis** — Persistencia de historiales (2h) y ubicaciones (24h), con fallback a memoria
+- 📦 **Fallback JSON** — Funciona sin Supabase usando búsqueda local con scoring ponderado
 
 ---
 
@@ -28,13 +35,13 @@ cd vecinito
 ### 2. Crear entorno virtual
 
 ```bash
-python -m venv .venv
+python -m venv venv
 
 # Windows
-.venv\Scripts\activate
+venv\Scripts\activate
 
 # Linux/Mac
-source .venv/bin/activate
+source venv/bin/activate
 ```
 
 ### 3. Instalar dependencias
@@ -48,32 +55,44 @@ pip install -r requirements.txt
 Crear archivo `.env` en la raíz del proyecto:
 
 ```env
+# === Requeridas ===
 TELEGRAM_TOKEN=tu_token_de_botfather
 OPENAI_API_KEY=tu_api_key_de_openai
+
+# === Opcionales ===
+SUPABASE_URL=tu_url_de_supabase
+SUPABASE_KEY=tu_key_de_supabase
 REDIS_URL=redis://localhost:6379
 ```
 
-### 5. Iniciar Redis (opcional pero recomendado)
+### 5. Configurar Supabase (recomendado)
 
-**Windows (con Docker):**
+Si usás Supabase con pgvector para búsqueda semántica:
+
 ```bash
+python setup_database.py
+```
+
+Esto genera embeddings con `text-embedding-3-small` y los carga a la tabla de Supabase.
+
+> Sin Supabase el bot funciona igual usando el archivo JSON local con búsqueda por scoring.
+
+### 6. Iniciar Redis (opcional)
+
+```bash
+# Docker
 docker run -d -p 6379:6379 redis
-```
 
-**Linux/Mac:**
-```bash
 # Ubuntu/Debian
-sudo apt install redis-server
-sudo systemctl start redis
+sudo apt install redis-server && sudo systemctl start redis
 
-# Mac con Homebrew
-brew install redis
-brew services start redis
+# Mac
+brew install redis && brew services start redis
 ```
 
-> ⚠️ Si Redis no está disponible, el bot funciona igual pero usa memoria local (se pierde al reiniciar).
+> ⚠️ Si Redis no está disponible, el bot usa memoria local (se pierde al reiniciar).
 
-### 6. Ejecutar el bot
+### 7. Ejecutar el bot
 
 ```bash
 python bot.py
@@ -84,29 +103,70 @@ python bot.py
 ## 📁 Estructura del Proyecto
 
 ```
-Vecinito/
+vecinito/
 ├── bot.py                  # 🤖 Bot principal (ejecutar este)
-├── data/
-│   ├── comercios.json      # 📦 Base de datos de comercios
-│   └── comercios.csv       # 📊 Fuente original (Excel/CSV)
-├── regenerar_json.py       # 🔄 Script para actualizar JSON desde CSV
+├── setup_database.py       # 🗄️ Carga comercios a Supabase con embeddings
+├── regenerar_json.py       # 🔄 Regenera comercios.json desde el CSV
 ├── requirements.txt        # 📋 Dependencias
+├── data/
+│   ├── comercios.json      # 📦 Base de datos de comercios (fallback)
+│   ├── comercios.csv       # 📊 Fuente original (CSV con ;)
+│   ├── logs_busquedas.csv  # 📝 Log de búsquedas (auto-generado)
+│   └── logs.csv            # 📝 Log general (auto-generado)
+├── test_agente.py          # 🧪 Tests del agente
+├── test_carga.py           # 🧪 Test de carga CSV
+├── test_contexto.py        # 🧪 Test de contexto
 ├── .env                    # 🔐 Variables de entorno (no commitear)
-├── .env.example            # 📝 Ejemplo de configuración
 └── .gitignore
-```
-
-### Archivos Legacy (no usados actualmente)
-```
-├── main.py                 # ⚠️ Versión anterior con LangGraph
-├── test_agente.py          # ⚠️ Tests de versión anterior
-├── test_carga.py           # ⚠️ Test de carga CSV
-└── data/memoria.db         # ⚠️ SQLite de versión anterior
 ```
 
 ---
 
-## 📊 Base de Datos de Comercios
+## 🔧 Arquitectura
+
+```
+Usuario (Telegram)
+       │
+       ▼
+   Handlers ──► Debounce Queue (5s, generation counter)
+                      │
+                      ▼
+              obtener_respuesta()
+                      │
+         ┌────────────┼────────────┐
+         ▼            ▼            ▼
+    Cache check   RAG Search    JSON Fallback
+    (LRU+TTL)    (Supabase     (scoring ponderado
+                  pgvector)     + sinónimos)
+                      │
+                      ▼
+              GPT-4o-mini (temp=0.3)
+              + system prompt (~180 líneas)
+              + historial (última hora)
+              + datos de comercios
+              + horarios (ABIERTO/CERRADO)
+              + distancias (si hay ubicación)
+                      │
+                      ▼
+              Post-procesamiento
+              (inyección links Maps)
+                      │
+                      ▼
+              Respuesta al usuario
+```
+
+---
+
+## 📊 Base de Datos
+
+### Tipos de entrada
+
+El bot maneja dos tipos de datos:
+
+| Tipo | Campos | Ejemplo |
+|------|--------|---------|
+| **Comercio** | nombre, categoría, zona, dirección, horarios, contacto, lat/lon, maps | Pizzería, Farmacia |
+| **Servicio** | nombre, rubro, experiencia, contacto | Plomero, Electricista |
 
 ### Formato JSON (`data/comercios.json`)
 
@@ -127,55 +187,49 @@ Vecinito/
 
 ### Actualizar comercios
 
-1. Editar `data/comercios.csv` (Excel)
-2. Ejecutar:
-```bash
-python regenerar_json.py
-```
+1. Editar `data/comercios.csv` (separador `;`)
+2. Regenerar el JSON:
+   ```bash
+   python regenerar_json.py
+   ```
+3. Si usás Supabase, recargar embeddings:
+   ```bash
+   python setup_database.py
+   ```
 
 ---
 
-## 🔧 Cómo Funciona
+## 🔍 Sistema de Búsqueda
 
-### Arquitectura Simple
+### Modo RAG (Supabase + pgvector)
+
+1. La consulta del usuario se expande con sinónimos
+2. Se genera un embedding con `text-embedding-3-small`
+3. Se busca en Supabase usando similitud vectorial
+4. Si no hay resultados, se usa el fallback JSON
+
+### Modo JSON (fallback)
+
+1. Se expande la query con sinónimos
+2. Se filtran stopwords (~40 palabras)
+3. Se calcula score ponderado por campo:
+   - `nombre` = peso 4
+   - `categoría/rubro` = peso 3
+   - `tags` = peso 1
+   - Bonus zona = +5
+4. Matching parcial: palabras ≥4 caracteres matchean como prefijo (50% del peso)
+5. Se devuelven los top 12 resultados
+
+### Sinónimos
+
+~150+ mapeos de lenguaje coloquial a términos de la base de datos:
 
 ```
-Usuario (Telegram)
-       ↓
-    bot.py
-       ↓
-   Redis (persistencia)
-       ↓
-   OpenAI GPT-4o-mini
-       ↓
-  comercios.json
-       ↓
-   Respuesta
+"pizza"    → pizzería
+"remedio"  → farmacia, medicamentos
+"plomero"  → plomería, cañerías
+"asado"    → carnicería, parrilla, carbón
 ```
-
-### Persistencia con Redis
-
-- **Historiales**: Se guardan en Redis con TTL de 2 horas
-- **Ubicaciones**: Se guardan en Redis con TTL de 24 horas
-- **Fallback**: Si Redis no está disponible, usa memoria local
-
-### Flujo de Conversación
-
-1. Usuario envía mensaje
-2. Se agrega al historial (con timestamp)
-3. Se filtran mensajes de la última hora
-4. Se envía a GPT-4o-mini con:
-   - Prompt del sistema
-   - Base de datos completa de comercios
-   - Historial de conversación
-5. GPT genera respuesta
-6. Se envía al usuario
-
-### Historial con Expiración
-
-- Cada mensaje tiene timestamp
-- Solo se envían al LLM mensajes de la última hora
-- Los mensajes viejos se limpian automáticamente
 
 ---
 
@@ -185,7 +239,8 @@ Usuario (Telegram)
 
 | Comando | Descripción |
 |---------|-------------|
-| `/start` | Inicia el bot y muestra ayuda |
+| `/start` | Bienvenida e instrucciones |
+| `/reset` | Borra el historial de conversación |
 
 ### Ejemplos de Búsqueda
 
@@ -196,16 +251,18 @@ Usuario (Telegram)
 👤 "Carnicerías cerca" (después de enviar ubicación)
 👤 "Hay más opciones?"
 👤 "¿Cuál está más cerca?"
+👤 🎙️ (nota de voz con la consulta)
 ```
 
 ### Botones del Teclado
 
-- 📍 **Enviar ubicación** - Ordena resultados por cercanía
-- 🏘️ **City Bell / Gonnet / Villa Elisa** - Filtrar por zona
+- 📍 **Enviar ubicación** — Ordena resultados por cercanía
+- 🏘️ **City Bell / Gonnet / Villa Elisa** — Filtrar por zona
+- **Botones inline de zona** — Aparecen automáticamente si no tenés ubicación ni zona definida
 
 ---
 
-## ⚙️ Configuración Avanzada
+## ⚙️ Configuración
 
 ### Variables de Entorno
 
@@ -213,64 +270,58 @@ Usuario (Telegram)
 |----------|-------------|-----------|
 | `TELEGRAM_TOKEN` | Token del bot de BotFather | ✅ |
 | `OPENAI_API_KEY` | API Key de OpenAI | ✅ |
-| `REDIS_URL` | URL de conexión Redis (default: redis://localhost:6379) | ❌ |
+| `SUPABASE_URL` | URL del proyecto Supabase | ❌ |
+| `SUPABASE_KEY` | Key del proyecto Supabase | ❌ |
+| `REDIS_URL` | URL de Redis (default: `redis://localhost:6379`) | ❌ |
 
-### Modelo de IA
+### Límites Configurables
 
-El bot usa `gpt-4o-mini` por defecto. Para cambiar:
+| Parámetro | Valor | Descripción |
+|-----------|-------|-------------|
+| `MAX_USUARIOS_MEMORIA` | 500 | Máx. usuarios en cache LRU |
+| `MAX_HISTORIAL_MENSAJES` | 20 | Máx. mensajes por historial |
+| `MAX_CACHE_EMBEDDINGS` | 2000 | Máx. embeddings cacheados |
+| `CACHE_TTL_MINUTOS` | 5 | TTL del cache de respuestas |
+| `DEBOUNCE_SEGUNDOS` | 5.0 | Ventana de debounce |
+| `MAX_MENSAJES_POR_MINUTO` | 10 | Rate limit por usuario |
+| `MAX_AUDIO_MB` | 10 | Tamaño máximo de audio |
 
-```python
-# En bot.py, línea ~165
-response = client.chat.completions.create(
-    model="gpt-4o-mini",  # Cambiar aquí
-    ...
-)
-```
+### Modelos de IA
 
-### Tiempo de Contexto
-
-Por defecto, el historial dura 1 hora. Para modificar:
-
-```python
-# En bot.py, función obtener_respuesta()
-hace_una_hora = ahora - timedelta(hours=1)  # Cambiar hours=X
-```
-
----
-
-## 📈 Categorías de Comercios
-
-| Categoría | Ejemplos |
-|-----------|----------|
-| Gastronomía | Pizzerías, Heladerías, Cafés, Restaurantes |
-| Salud | Farmacias, Ópticas |
-| Comercio | Kioscos, Ferreterías |
-| Almacén | Carnicerías, Verdulerías |
-| Servicios | Veterinarias, Gimnasios, Peluquerías |
+| Uso | Modelo |
+|-----|--------|
+| Chat | `gpt-4o-mini` (temp=0.3, max_tokens=1000) |
+| Embeddings | `text-embedding-3-small` |
+| Audio | `whisper-1` |
 
 ---
 
-## 🛠️ Desarrollo
+## 🛡️ Resiliencia
 
-### Requisitos
+- **Redis caído** → Fallback a memoria local (LRU con límite de 500 usuarios)
+- **Supabase caído** → Fallback a búsqueda local en JSON con scoring ponderado
+- **Markdown inválido** → Reintento con texto plano
+- **Errores generales** → Mensaje amigable al usuario + log del error
+- **Cache periódica** → Limpieza automática cada 1 hora
 
-- Python 3.10+
-- Cuenta de Telegram (para crear bot con BotFather)
-- API Key de OpenAI
+---
 
-### Dependencias Principales
+## 📋 Dependencias
 
-```
-python-telegram-bot>=20.0   # Bot de Telegram
-openai>=1.0.0               # API de OpenAI
-python-dotenv>=1.0.0        # Variables de entorno
-redis>=5.0.0                # Persistencia de historiales
-```
-
-### Dependencias Opcionales
+### Requeridas
 
 ```
-pandas>=2.0.0               # Solo para regenerar_json.py (CSV → JSON)
+python-telegram-bot==22.6     # Bot de Telegram
+openai==2.20.0                # API de OpenAI (chat, embeddings, whisper)
+python-dotenv==1.2.1          # Variables de entorno
+redis==7.1.1                  # Persistencia de historiales
+```
+
+### Opcionales
+
+```
+supabase                      # RAG con pgvector
+pandas==3.0.0                 # Solo para regenerar_json.py (CSV → JSON)
 ```
 
 ---
@@ -281,20 +332,4 @@ MIT
 
 ---
 
-## 👥 Contribuir
 
-1. Fork del repositorio
-2. Crear rama (`git checkout -b feature/nueva-funcionalidad`)
-3. Commit (`git commit -m 'Agrega nueva funcionalidad'`)
-4. Push (`git push origin feature/nueva-funcionalidad`)
-5. Crear Pull Request
-
----
-
-## 📞 Soporte
-
-¿Problemas? Abrí un issue en GitHub.
-
----
-
-Desarrollado con ❤️ para el Corredor Norte de La Plata
