@@ -1,0 +1,12 @@
+# Vecinito - Dependencias
+# Bot de Telegram para comercios locales
+
+# === REQUERIDAS ===
+python-telegram-bot==22.6     # Bot de Telegram
+openai==2.20.0                # API de OpenAI
+python-dotenv==1.2.1          # Variables de entorno
+redis==7.1.1                  # Persistencia de historiales
+
+# === OPCIONALES ===
+pandas==3.0.0                 # Solo para regenerar_json.py (CSV → JSON)
+supabase

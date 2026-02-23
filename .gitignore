@@ -1,0 +1,19 @@
+# === Entorno ===
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# === Datos locales ===
+data/logs_busquedas.csv
+data/logs.csv
+data/memoria.db
+
+# === IDE ===
+.vscode/
+.idea/
+*.code-workspace
+
+# === OS ===
+Thumbs.db
+.DS_Store
