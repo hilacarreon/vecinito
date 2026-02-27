@@ -104,11 +104,11 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # ── Límites ──
 MAX_USUARIOS_MEMORIA    = 500
-MAX_HISTORIAL_MENSAJES  = 20
+MAX_HISTORIAL_MENSAJES  = 10
 MAX_CACHE_EMBEDDINGS    = 2000
-CACHE_TTL_MINUTOS       = 5
+CACHE_TTL_MINUTOS       = 2
 MAX_CACHE_RESPUESTAS    = 1000
-DEBOUNCE_SEGUNDOS       = 5.0
+DEBOUNCE_SEGUNDOS       = 1.5
 MAX_MENSAJES_POR_MINUTO = 10
 MAX_AUDIO_MB            = 10
 
@@ -150,7 +150,7 @@ if not supabase:
         with open(json_path, "r", encoding="utf-8") as f:
             COMERCIOS = json.load(f)
         for i, c in enumerate(COMERCIOS):
-            comp = {k: v for k, v in c.items() if k not in ("lat", "lon", "maps")}
+            comp = dict(c)  # Copiar todo (incluyendo lat, lon, maps)
             comp["id"] = i
             COMERCIOS_COMPACTO.append(comp)
         logger.info(f"📦 Fallback JSON: {len(COMERCIOS)} entradas")
@@ -187,6 +187,9 @@ ubicaciones_memoria = LRUDict(MAX_USUARIOS_MEMORIA)
 
 # Set para trackear usuarios que ya recibieron bienvenida (en esta sesión)
 _usuarios_bienvenida: set[str] = set()
+
+# Keyboards pendientes para enviar con la primera respuesta de búsqueda
+_keyboards_pendientes: dict[str, ReplyKeyboardMarkup] = {}
 
 # ══════════════════════════════════════════════════════════
 # CACHÉS
@@ -449,9 +452,11 @@ def eliminar_historial(user_id: str):
     if redis_client:
         try:
             redis_client.delete(f"historial:{user_id}")
+            redis_client.delete(f"ubicacion:{user_id}")
         except Exception:
             pass
     historiales_memoria.pop(user_id, None)
+    ubicaciones_memoria.pop(user_id, None)
 
 
 def obtener_ubicacion(user_id: str) -> tuple | None:
@@ -787,7 +792,7 @@ _PESO_CAMPO = {
 }
 
 
-def filtrar_json_local(consulta: str, zona: str | None = None, top_k: int = 12) -> list[dict]:
+def filtrar_json_local(consulta: str, zona: str | None = None, top_k: int = 6) -> list[dict]:
     """
     Filtro mejorado con:
     - Scoring ponderado por campo
@@ -844,7 +849,7 @@ def filtrar_json_local(consulta: str, zona: str | None = None, top_k: int = 12) 
     return resultado
 
 
-async def buscar_relevantes(consulta: str, zona: str | None = None, top_k: int = 12) -> list[dict]:
+async def buscar_relevantes(consulta: str, zona: str | None = None, top_k: int = 6) -> list[dict]:
     """Búsqueda semántica en Supabase. Fallback a filtro JSON."""
     if not supabase:
         return filtrar_json_local(consulta, zona=zona, top_k=top_k)
@@ -964,9 +969,11 @@ async def _esperar_y_procesar(user_id: str, generation: int):
         if not mensajes or not update:
             return
 
+        # FIX v5: Concatenar con espacio en vez de numerar.
+        # "quiero" + "una" + "birra" → "quiero una birra" (no "1. quiero\n2. una\n3. birra")
         mensaje_final = (
             mensajes[0] if len(mensajes) == 1
-            else "\n".join(f"{i+1}. {m}" for i, m in enumerate(mensajes))
+            else " ".join(mensajes)
         )
 
         if len(mensajes) > 1:
@@ -980,8 +987,12 @@ async def _esperar_y_procesar(user_id: str, generation: int):
         respuesta = await obtener_respuesta(user_id, mensaje_final, skip_log=True)
         logger.info(f"Respuesta: {respuesta[:100]}...")
 
-        # Enviar respuesta
-        await responder_seguro(update.message, respuesta, disable_web_page_preview=True)
+        # Enviar respuesta (con teclado pendiente si es primera búsqueda de usuario nuevo)
+        extra_kwargs = {"disable_web_page_preview": True}
+        kb = _keyboards_pendientes.pop(user_id, None)
+        if kb:
+            extra_kwargs["reply_markup"] = kb
+        await responder_seguro(update.message, respuesta, **extra_kwargs)
 
     except asyncio.CancelledError:
         pass
@@ -994,154 +1005,71 @@ async def _esperar_y_procesar(user_id: str, generation: int):
 # ══════════════════════════════════════════════════════════
 
 PROMPT_SISTEMA_BASE = """
-=== IDENTIDAD ===
-Sos "Vecinito" 🏘️, el guía local de City Bell, Gonnet y Villa Elisa.
-Sos un vecino, no un robot. Hablás de igual a igual, con buena onda.
-Tu único objetivo es ayudar a encontrar COMERCIOS y SERVICIOS de la zona.
+Sos "Vecinito" 🏘️, guía local de City Bell, Gonnet y Villa Elisa. Hablás como vecino argentino con buena onda.
+Tu ÚNICO tema: comercios y servicios de la zona. Fuera de eso: "Jaja, eso no es lo mío 😅 Yo te ayudo con comercios y servicios de la zona. ¿Necesitás algo?"
+Excepciones que SÍ manejás: saludos/despedidas (respondé breve), contexto previo a un pedido, feedback ("no me sirve" → alternativas), preguntas sobre vos.
 
-=== TIPOS DE ENTRADA ===
-Hay dos tipos de datos en "DATOS DISPONIBLES":
-- COMERCIO: tiene campo "categoria". Tiene dirección, horarios, zona. Es un local físico.
-- SERVICIO: tiene campo "rubro". NO tiene dirección, zona ni horarios. Es una persona que trabaja a domicilio.
+TIPOS DE DATOS:
+- COMERCIO (campo "categoria"): local físico con dirección, horarios, zona.
+- SERVICIO (campo "rubro"): persona a domicilio. NUNCA inventes dirección/horarios para servicios.
 
-Diferencia clave: los servicios son personas que van al domicilio del cliente, por eso no tienen local ni horarios fijos. NUNCA inventes dirección, zona ni horarios para un servicio.
+TONO:
+- Reacción empática breve ANTES de mostrar resultados. Ej: comida → "Uhhh, se viene el antojo! 😋", urgencia → "Uh, qué garrón. Pero se soluciona 💪"
+- Lenguaje natural: "Dale", "Fijate", "Te paso". NUNCA: "Su solicitud", "He encontrado", "A continuación".
+- Máx 1-2 emojis por mensaje (fuera de tarjetas). Sé conciso.
 
-=== LÍMITE DE TEMA ===
-SOLO respondés sobre comercios, servicios, productos y oficios de la zona.
+HORARIOS — CRÍTICO:
+El campo "estado_actual" está PRECALCULADO por el sistema. Confiá en él ciegamente:
+- "ABIERTO AHORA ✅" → está abierto. NUNCA digas "todos cerrados" si al menos uno tiene esto.
+- "CERRADO AHORA ❌" → está cerrado.
+- Sin campo → no se pudo determinar, mostrá horario tal cual.
+NUNCA calcules horarios por tu cuenta.
 
-Excepciones que SÍ debés manejar naturalmente (NO son fuera de tema):
-- Saludos y despedidas: "gracias", "genial", "chau", "dale", "ya lo llamo" → respondé con calidez breve ("De nada! Cualquier cosa acá estoy 😊").
-- Contexto antes de un pedido: "está lloviendo y necesito un techista" → la intención es buscar un servicio, respondé normalmente.
-- Feedback: "no me sirve", "muy lejos", "otro?" → ofrecé alternativas o pedí más contexto.
-- Preguntas sobre vos: "qué sos?", "cómo funcionás?" → respondé brevemente que sos un bot vecinal que ayuda a encontrar comercios y servicios en City Bell, Gonnet y Villa Elisa.
-- Pedido específico por nombre: "tenés el teléfono de Pizzería Los Tíos?" → si está en los datos, respondé con esa única entrada sin listar alternativas innecesarias.
+Si piden "abiertos": mostrá SOLO los que tengan "ABIERTO AHORA ✅". Solo decí "todos cerrados" si NINGUNO lo tiene.
+Si NO piden "abiertos": mostrá todos, pero incluí "ABIERTO AHORA ✅" en 🕐 cuando corresponda.
 
-Para temas genuinamente fuera de alcance (política, clima, recetas, matemática, etc.) respondé SOLO:
-"Jaja, eso no es lo mío 😅 Yo te ayudo con comercios y servicios de la zona. ¿Necesitás algo?"
+BÚSQUEDAS:
+- Rubro específico (plomero, farmacia) → SOLO ese rubro, no mezclar.
+- Búsqueda amplia (comida) → variedad de rubros.
+- Contexto conversacional: si dicen "cuáles están abiertas" sin especificar, usá el historial.
+- Servicios: ordenar por experiencia (mayor primero).
+- Con ubicación: los datos llegan ordenados por cercanía. Respetá ese orden.
 
-CLAVE: evaluá siempre la INTENCIÓN FINAL del mensaje. Si la intención es encontrar un comercio o servicio, respondé aunque haya contexto irrelevante de por medio.
+CERO INVENCIÓN:
+Solo mostrá info TEXTUAL de DATOS DISPONIBLES. Sin dato → indicá que no está disponible.
+Tip 💡 solo con info verificable de los datos. Sin nada verificable → no pongas tip.
+Campo "tags" es interno, NUNCA mostrarlo.
 
-=== REGLAS DE TONO ===
-1. REACCIÓN ANTES DE ACCIÓN: Primero empatizá brevemente con lo que piden.
-   - Comida: "Uhhh, se viene el antojo! 😋"
-   - Problema urgente: "Uh, qué garrón. Pero tranqui, se soluciona 💪"
-   - Búsqueda general: "Dale, te busco!"
-2. LENGUAJE NATURAL: "Dale", "Fijate", "Te paso", "Buenísimo", "Che".
-   NUNCA uses: "Su solicitud", "He encontrado", "Procesando", "A continuación".
-3. Máximo 1-2 emojis por mensaje (fuera de las tarjetas de resultado).
-4. Sé conciso. No repitas información ni agregues relleno.
-
-=== INSTRUCCIONES DE RAZONAMIENTO ===
-
-1. CONTEXTO CONVERSACIONAL:
-   Leé el historial completo antes de responder. Si dicen "cuáles están abiertas" sin especificar qué, buscá en el historial qué estaban buscando antes. Si no hay contexto previo, preguntá: "¿Abiertas de qué? Contame qué buscás 😊"
-
-2. INTERPRETACIÓN DE BÚSQUEDAS:
-   - Marcas (Coca-Cola, Franui, Havanna) → buscar KIOSCOS o comercios que vendan esa marca.
-   - Productos genéricos (pizza, clavos, pan) → buscar el RUBRO correspondiente (pizzería, ferretería, panadería).
-   - Rubro directo (plomero, electricista) → buscar ese rubro en servicios o comercios.
-   - Si la búsqueda es ambigua entre comercio y servicio (ej: "cerrajero"), mostrá ambos tipos si existen en los datos.
-   - Si la búsqueda es amplia (ej: "comida"), mostrá variedad de rubros gastronómicos, no solo uno.
-
-3. HORARIOS — REGLAS:
-   El mensaje del usuario incluye automáticamente: [Hoy es {Día} {Fecha}, son las {Hora} hs]
-
-   IMPORTANTE — CAMPO "estado_actual":
-   Cada comercio PUEDE tener un campo "estado_actual" precalculado por el sistema:
-   - "ABIERTO AHORA ✅" → el comercio ESTÁ abierto en este momento. Confiá en este dato.
-   - "CERRADO AHORA ❌" → el comercio ESTÁ cerrado en este momento. Confiá en este dato.
-   - Si NO tiene campo "estado_actual" → no se pudo determinar. Mostrá el horario tal cual sin afirmar si está abierto o cerrado.
-
-   NUNCA intentes calcular horarios por tu cuenta. SIEMPRE usá el campo "estado_actual" si existe.
-
-   Reglas según lo que pide el usuario:
-   a) Si pide "ABIERTOS" o "ABIERTOS AHORA": SOLO mostrá los que tengan estado_actual = "ABIERTO AHORA ✅". Si ninguno está abierto, decí: "Uf, a esta hora están todos cerrados 😴 ¿Querés que te muestre los horarios para que vayas después?"
-   b) Si pide comercios SIN especificar "abiertos": mostrá todos los relevantes. Si tiene estado_actual "ABIERTO AHORA ✅", incluilo en el campo horario. Si tiene "CERRADO AHORA ❌", mostrá solo el horario normal sin destacar.
-   c) NUNCA ocultes un comercio relevante solo porque está cerrado, a menos que el usuario haya pedido explícitamente "abiertos".
-   d) Si un comercio no tiene horarios cargados en los datos, mostrá "🕐 Consultar horarios" en vez de inventar.
-
-4. RANKING Y ORDEN DE RESULTADOS:
-   a) Si hay "UBICACIÓN DEL USUARIO" en el contexto:
-      - Urgencias (farmacia, plomero, electricista, cerrajero, gasista): ordenar por CERCANÍA.
-      - Gastronomía y experiencias (parrilla, heladería, "lugar lindo"): ordenar por ESPECIALIDAD/relevancia, pero mostrar distancia.
-      - Resto: ordenar por CERCANÍA.
-   b) Si NO hay ubicación del usuario:
-      - Ordenar por RELEVANCIA al pedido (qué tan bien matchea con lo que busca).
-      - Si detectás una zona en el mensaje ("en City Bell"), priorizá esa zona.
-   c) Para SERVICIOS: priorizar por AÑOS DE EXPERIENCIA (mayor primero).
-
-5. SIN RESULTADOS:
-   - Si no hay nada en los datos: "Uh, no tengo [X] en mi base todavía 😅 Si conocés alguno, avisame y lo sumo!"
-   - Si hay resultados pero ninguno abierto (y pidió abiertos): "Uf, a esta hora están todos cerrados 😴 Te paso los horarios así sabés cuándo ir:"
-
-=== REGLA DE ORO: CERO INVENCIÓN ===
-SOLO podés mostrar información que esté TEXTUALMENTE en los DATOS DISPONIBLES.
-- Si un dato no está (teléfono, horario, dirección): NO lo inventes. Indicá que no está disponible.
-- Si un comercio/servicio no aparece en DATOS DISPONIBLES: NO existe para vos, aunque lo conozcas del mundo real.
-- El tip final (💡) SOLO puede contener información que se desprenda de los datos (ej: "es el más cercano" si la distancia lo confirma, "tiene más experiencia" si los años lo confirman). NUNCA inventes atributos como "tiene delivery", "es el mejor", "tiene estacionamiento" si no está en los datos.
-
-=== MANEJO DE DATOS INCOMPLETOS ===
-- Sin teléfono/contacto: no pongas el campo 📞 (excepto en servicios donde es crítico; en ese caso poné "📞 No disponible — consultá por redes").
-- Sin horarios (en comercio): poné "🕐 Consultar horarios".
-- Sin dirección (en comercio): poné "📫 Consultar dirección".
-- Sin experiencia (en servicio): no pongas el campo ⭐.
-- Campo "tags" es SOLO para tu razonamiento interno. NUNCA lo muestres al usuario.
-
-=== FORMATO DE RESPUESTA ===
-
-COMERCIO:
-[Reacción empática breve]
-
+FORMATO COMERCIO:
 📍 *[Nombre]*
 🏷️ [Categoría]
 📫 [Dirección]
-🕐 [Horarios — agregar "ABIERTO AHORA ✅" si corresponde]
-🚶 [X.X km / X metros] ← SOLO si hay "UBICACIÓN DEL USUARIO" en el contexto
-📞 [Contacto] ← SOLO si existe en los datos
+🕐 [Horarios + estado_actual si aplica]
+🚶 [Distancia] ← SOLO si el comercio tiene campo "distancia" en los datos
+📞 [Contacto] ← OBLIGATORIO si existe
 
-SERVICIO:
-[Reacción empática breve]
-
+FORMATO SERVICIO:
 🔧 *[Nombre]*
 🏷️ [Rubro]
-⭐ [X años de experiencia] ← SOLO si existe en los datos
-📞 [Contacto] ← OBLIGATORIO, si no existe poné "No disponible"
+⭐ [Experiencia] ← solo si existe
+📞 [Contacto] ← OBLIGATORIO
 
-REGLAS DE FORMATO:
-- SIN líneas separadoras (no uses ---, ***, ===, etc.)
-- Negrita SOLO para el nombre del comercio/servicio: *Nombre*
-- Una línea vacía entre cada tarjeta
-- Máximo 4 resultados por respuesta (si hay más, mostrá los 4 mejores y ofrecé: "¿Querés que te muestre más opciones?")
-- Si el usuario pide uno específico por nombre, mostrá solo ese
-- NO incluyas links de Google Maps (se agregan automáticamente después)
-- Distancia 🚶 SOLO si ves "UBICACIÓN DEL USUARIO" en el contexto
-- Tip final 💡 SOLO si podés decir algo útil basado en los datos reales. Si no, no pongas tip.
+Máx 4 resultados. Sin separadores (---, ***). No incluir links de Maps. Una línea vacía entre tarjetas.
+SOLO mostrá resultados del rubro pedido. NUNCA agregues comercios de otro rubro "por las dudas" o "ya que estamos". Si pidió carnicerías, mostrá carnicerías y punto.
+No agregues párrafos extra después de las tarjetas. La respuesta termina con la última tarjeta o con un tip verificable 💡. Nada más.
+Feedback "gracias/genial" → "De nada! Cualquier cosa acá estoy 😊"
+Sin resultados → "Uh, no tengo [X] en mi base todavía 😅 Si conocés alguno, avisame y lo sumo!"
 
-=== MANEJO DE FEEDBACK DEL USUARIO ===
-- "No me sirve" / "Muy lejos" / "Otro" / "Alguno más?" → Ofrecé alternativas de los datos. Si no hay más, decilo: "No tengo más opciones de [X] cargadas 😅"
-- "Gracias" / "Genial" / "Dale" / "Ya lo llamo" → "De nada! Cualquier cosa acá estoy 😊" (breve, sin forzar otra búsqueda)
-- "No entiendo" / respuesta confusa del usuario → Pedí clarificación amablemente: "No te entendí bien 😅 ¿Qué estás buscando?"
+EJEMPLO — Abiertos (hay al menos uno):
+Dale, te busco las que estén abiertas 💪
 
-=== EJEMPLOS ===
+📍 *Farmacia Santa Ana 24hs*
+🏷️ Farmacia
+📫 Calle 14 nro 1200, City Bell
+🕐 ABIERTO AHORA ✅ · 24 horas
+📞 +54 221 456 7893
 
-Ejemplo 1 — COMERCIO (búsqueda de pizza):
-Uhhh, se viene la pizza! 🍕
-
-📍 *Pizzería Los Tíos*
-🏷️ Gastronomía
-📫 Calle 13 nro 456, City Bell
-🕐 ABIERTO AHORA ✅ · L-V 18-23 | S-D 12-24
-📞 https://wa.me/5492214567890
-
-📍 *Pizza Napoli*
-🏷️ Gastronomía
-📫 Calle 14 nro 890, City Bell
-🕐 L-D 19-24
-📞 +54 221 456 1001
-
-💡 Los Tíos está abierto ahora si tenés hambre ya!
-
-Ejemplo 2 — SERVICIO (búsqueda de plomero):
+EJEMPLO — Servicio:
 Uh, qué garrón. Pero se soluciona 💪
 
 🔧 *Carlos Pérez*
@@ -1149,43 +1077,17 @@ Uh, qué garrón. Pero se soluciona 💪
 ⭐ 15 años de experiencia
 📞 +54 221 555 1234
 
-🔧 *Mario Gómez*
-🏷️ Plomero
-⭐ 8 años de experiencia
-📞 https://wa.me/5492215551235
-
 💡 Carlos es el que tiene más experiencia!
 
-Ejemplo 3 — COMERCIO CON UBICACIÓN:
-Dale, te busco lo más cercano 📍
-
-📍 *Farmacia Santa Ana 24hs*
-🏷️ Salud
-📫 Calle 14 nro 1200, City Bell
-🕐 ABIERTO AHORA ✅ · 24 horas
-🚶 450 metros
-📞 +54 221 456 7893
-
-💡 Es la más cercana y está abierta las 24hs!
-
-Ejemplo 4 — SIN RESULTADOS:
-Uh, no tengo veterinarias cargadas en mi base todavía 😅
-Si conocés alguna de la zona, avisame y la sumo!
-
-Ejemplo 5 — TODOS CERRADOS (pidió "abiertos"):
+EJEMPLO — Todos cerrados (NINGUNO tiene ABIERTO AHORA):
 Uf, a esta hora las panaderías están todas cerradas 😴
-Te paso las opciones así sabés cuándo ir:
 
 📍 *Panadería Don Juan*
 🏷️ Panadería
 📫 Calle 7 nro 300, Gonnet
 🕐 L-S 7-13 | D cerrado
-
-Ejemplo 6 — FEEDBACK "no me sirve":
-Usuario: "no, esos no, algún otro?"
-Dale, te busco más opciones! [muestra otros resultados de los datos]
-— o si no hay más: "No tengo más [rubro] cargados por ahora 😅 ¿Te puedo ayudar con otra cosa?"
 """
+
 
 
 # ══════════════════════════════════════════════════════════
@@ -1221,6 +1123,110 @@ def inyectar_maps_links(respuesta: str, comercios: list[dict]) -> str:
     return respuesta
 
 
+def corregir_contradiccion_cerrados(respuesta: str, relevantes: list[dict]) -> str:
+    """
+    FIX v5: Si la respuesta dice "cerrados/cerradas" pero hay comercios
+    con estado_actual ABIERTO o con horario 24hs, corregir la intro.
+    """
+    resp_lower = respuesta.lower()
+
+    # Detectar si el LLM dice que están todos cerrados
+    frases_cerrado = [
+        "están todos cerrados", "están todas cerradas",
+        "a esta hora están todos cerrad", "a esta hora están todas cerrad",
+        "todos cerrados", "todas cerradas",
+    ]
+    tiene_frase_cerrado = any(f in resp_lower for f in frases_cerrado)
+
+    if not tiene_frase_cerrado:
+        return respuesta
+
+    # Verificar si hay alguno abierto en los datos
+    hay_abierto = any(
+        c.get("estado_actual", "").startswith("ABIERTO")
+        for c in relevantes
+    )
+
+    if not hay_abierto:
+        return respuesta  # Realmente están todos cerrados, no corregir
+
+    # Hay contradicción: dice cerrados pero hay abiertos → corregir la intro
+    logger.warning("⚠️ Contradicción detectada: LLM dijo 'cerrados' pero hay abiertos. Corrigiendo.")
+
+    # Reemplazar las frases de cerrado más comunes
+    reemplazos = [
+        ("Uf, a esta hora están todos cerrados 😴\nTe paso las opciones así sabés cuándo ir:",
+         "Dale, te paso las opciones que encontré 👇"),
+        ("Uf, a esta hora están todos cerrados 😴 Te paso las opciones así sabés cuándo ir:",
+         "Dale, te paso las opciones que encontré 👇"),
+        ("Uf, a esta hora están todas cerradas 😴\nTe paso las opciones así sabés cuándo ir:",
+         "Dale, te paso las opciones que encontré 👇"),
+        ("Uf, a esta hora están todas cerradas 😴 Te paso las opciones así sabés cuándo ir:",
+         "Dale, te paso las opciones que encontré 👇"),
+    ]
+
+    for viejo, nuevo in reemplazos:
+        if viejo in respuesta:
+            respuesta = respuesta.replace(viejo, nuevo)
+            return respuesta
+
+    # Fallback: reemplazar genérico
+    respuesta = re.sub(
+        r"[Uu]f.*?cerrad[oa]s.*?(?:😴|\.)",
+        "Dale, te paso las opciones que encontré 👇",
+        respuesta,
+        count=1,
+    )
+
+    # También corregir frases de cierre que dicen "cuando abran"
+    respuesta = re.sub(
+        r"[¡!]?[Ee]spero que puedas ir.*?cuando abr[ae]n!?",
+        "",
+        respuesta,
+    )
+
+    return respuesta
+
+
+def _detectar_refinamiento(mensaje: str) -> bool:
+    """
+    Detecta si el mensaje es un refinamiento de la búsqueda anterior
+    (corto, sin rubro nuevo, tipo "algo barato", "más cerca", "al aire libre").
+    """
+    msg = normalizar_texto(mensaje)
+    palabras = msg.split()
+
+    # Mensajes muy cortos sin keywords de rubro → probable refinamiento
+    if len(palabras) > 6:
+        return False
+
+    # Si tiene sinónimos de rubro, es una búsqueda nueva
+    for p in palabras:
+        if p in SINONIMOS:
+            return False
+
+    # Palabras típicas de refinamiento
+    _REFINAMIENTO_KEYWORDS = {
+        "barato", "baratos", "barata", "baratas", "economico", "economica",
+        "caro", "caros", "cara", "caras", "premium",
+        "cerca", "cercano", "cercana", "cercanos", "cercanas",
+        "lejos", "otro", "otra", "otros", "otras", "distinto", "distinta",
+        "mejor", "mejores", "mas", "menos", "grande", "chico",
+        "lindo", "linda", "tranquilo", "tranquila",
+        "aire", "libre", "terraza", "patio", "afuera",
+        "delivery", "llevar", "rapido", "rapida",
+    }
+
+    if any(p in _REFINAMIENTO_KEYWORDS for p in palabras):
+        return True
+
+    # Muy corto y sin sustancia → "no", "otro", "mmm"
+    if len(palabras) <= 2:
+        return True
+
+    return False
+
+
 async def obtener_respuesta(user_id: str, mensaje: str, skip_log: bool = False) -> str:
     historial = obtener_historial(user_id)
     ahora     = datetime.now()
@@ -1245,20 +1251,39 @@ async def obtener_respuesta(user_id: str, mensaje: str, skip_log: bool = False) 
 
     guardar_historial(user_id, historial_rec)
 
-    # ── Caché ─────────────────────────────────────────────
+    # ── Ubicación y caché setup ─────────────────────────────
     ubicacion       = obtener_ubicacion(user_id)
     tiene_ubicacion = ubicacion is not None
+    cache_activo    = cache_respuestas_usuario  # Siempre per-user
+    cache_label     = "personal"
 
+    # ── Contexto dinámico ─────────────────────────────────
+    dias = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+    ctx  = (
+        f"[Hoy es {dias[ahora.weekday()]} {ahora.strftime('%d/%m/%Y')}, "
+        f"son las {ahora.strftime('%H:%M')} hs]\n"
+    )
+
+    # ── FIX v5: Refinamiento contextual ───────────────────
+    # Si el mensaje es un refinamiento ("algo barato", "más cerca"),
+    # concatenar con la última búsqueda del usuario para no perder contexto.
+    busqueda_msg = mensaje
+    if _detectar_refinamiento(mensaje):
+        ultimo_user = next(
+            (m["content"] for m in reversed(historial_rec[:-1]) if m["role"] == "user"),
+            None,
+        )
+        if ultimo_user:
+            busqueda_msg = f"{ultimo_user} {mensaje}"
+            logger.info(f"Refinamiento detectado: '{mensaje}' → '{busqueda_msg}'")
+
+    # ── Caché lookup (con busqueda_msg para incluir contexto de refinamiento) ──
     if tiene_ubicacion:
         lat_u, lon_u = ubicacion
         loc_hash     = f"{lat_u:.4f},{lon_u:.4f}"
-        cache_key    = hashlib.md5(f"{user_id}:{loc_hash}:{mensaje}".encode()).hexdigest()
-        cache_activo = cache_respuestas_usuario
-        cache_label  = "personal"
+        cache_key    = hashlib.md5(f"{user_id}:{loc_hash}:{busqueda_msg}".encode()).hexdigest()
     else:
-        cache_key    = hashlib.md5(normalizar_texto(mensaje).encode()).hexdigest()
-        cache_activo = cache_respuestas_global
-        cache_label  = "global"
+        cache_key    = hashlib.md5(f"{user_id}:{normalizar_texto(busqueda_msg)}".encode()).hexdigest()
 
     if cache_key in cache_activo:
         cached = cache_activo[cache_key]
@@ -1271,46 +1296,61 @@ async def obtener_respuesta(user_id: str, mensaje: str, skip_log: bool = False) 
             guardar_historial(user_id, historial_rec)
             return cached["respuesta"]
 
-    # ── Contexto dinámico ─────────────────────────────────
-    dias = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-    ctx  = (
-        f"[Hoy es {dias[ahora.weekday()]} {ahora.strftime('%d/%m/%Y')}, "
-        f"son las {ahora.strftime('%H:%M')} hs]\n"
-    )
-
     # ── Búsqueda ──────────────────────────────────────────
-    zona     = detectar_zona(mensaje)
-    busqueda = f"{mensaje} {zona}" if zona else mensaje
+    zona     = detectar_zona(busqueda_msg)
+    busqueda = f"{busqueda_msg} {zona}" if zona else busqueda_msg
 
-    relevantes = await buscar_relevantes(busqueda, zona=zona, top_k=12)
+    relevantes = await buscar_relevantes(busqueda, zona=zona)
 
-    # Distancias
+    # Distancias — inyectar directo en cada comercio
     if ubicacion:
         lat_u, lon_u = ubicacion
-        distancias = {}
         for c in relevantes:
-            if c.get("lat") and c.get("lon"):
-                d = calcular_distancia(lat_u, lon_u, c["lat"], c["lon"])
-                distancias[c["nombre"]] = d
+            c_lat = c.get("lat")
+            c_lon = c.get("lon")
+            if c_lat is not None and c_lon is not None:
+                d = calcular_distancia(lat_u, lon_u, c_lat, c_lon)
+                c["_distancia_km"] = d
+                # Formato legible para el LLM
+                c["distancia"] = f"{int(d * 1000)} metros" if d < 1.0 else f"{d:.1f} km"
 
-        if distancias:
-            def fmt(d):
-                return f"{int(d * 1000)} metros" if d < 1.0 else f"{d:.1f} km"
+        # FIX v5: Ordenar resultados por cercanía antes de pasarlos al LLM
+        relevantes.sort(key=lambda c: c.get("_distancia_km", 999))
 
-            lista = "\n".join(
-                f"- {n}: a {fmt(d)}"
-                for n, d in sorted(distancias.items(), key=lambda x: x[1])
-            )
-            ctx += f"\nUBICACIÓN DEL USUARIO — Distancias REALES:\n{lista}\n"
+        ctx += "El usuario compartió su UBICACIÓN. Mostrá la distancia 🚶 en cada tarjeta.\n"
 
     # Inyectar estado de horario precalculado (ABIERTO/CERRADO)
     inyectar_estado_horario(relevantes, ahora)
 
-    # JSON para el LLM
-    datos_llm = [
-        {k: v for k, v in c.items() if k not in ("lat", "lon", "maps", "id")}
-        for c in relevantes
+    # FIX v5: Contar abiertos e inyectar resumen en contexto
+    abiertos_ahora = [
+        c for c in relevantes if c.get("estado_actual", "").startswith("ABIERTO")
     ]
+    if abiertos_ahora:
+        nombres_abiertos = ", ".join(c["nombre"] for c in abiertos_ahora[:6])
+        ctx += (
+            f"\n⚠️ HAY {len(abiertos_ahora)} COMERCIO(S) ABIERTO(S) AHORA: "
+            f"{nombres_abiertos}\n"
+            f"NO digas que están todos cerrados.\n"
+        )
+
+    # JSON para el LLM — limpio y compacto para ahorrar tokens
+    _CAMPOS_EXCLUIR = {"lat", "lon", "maps", "id", "tags", "embedding", "similarity", "_distancia_km"}
+    datos_llm = []
+    for c in relevantes:
+        entry = {}
+        # estado_actual primero para visibilidad
+        if "estado_actual" in c:
+            entry["estado_actual"] = c["estado_actual"]
+        for k, v in c.items():
+            if k in _CAMPOS_EXCLUIR or k == "estado_actual":
+                continue
+            # Omitir campos vacíos/nulos para ahorrar tokens
+            if v is None or v == "" or v == []:
+                continue
+            entry[k] = v
+        datos_llm.append(entry)
+
     datos_json = json.dumps(datos_llm, ensure_ascii=False, separators=(",", ":"))
 
     prompt = PROMPT_SISTEMA_BASE + f"\n=== DATOS DISPONIBLES ===\n{datos_json}\n=== FIN DATOS ==="
@@ -1324,18 +1364,19 @@ async def obtener_respuesta(user_id: str, mensaje: str, skip_log: bool = False) 
 
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.1",
             messages=[{"role": "system", "content": prompt}, *mensajes_llm],
             temperature=0.3,
-            max_tokens=1000,
+            max_completion_tokens=700,
         )
 
         respuesta = response.choices[0].message.content
         respuesta = inyectar_maps_links(respuesta, relevantes)
+        respuesta = corregir_contradiccion_cerrados(respuesta, relevantes)
 
         u     = response.usage
-        costo = ((u.prompt_tokens / 1_000_000) * 0.15) + \
-                ((u.completion_tokens / 1_000_000) * 0.60)
+        costo = ((u.prompt_tokens / 1_000_000) * 1.25) + \
+                ((u.completion_tokens / 1_000_000) * 10.00)
         logger.info(
             f"Tokens → {u.prompt_tokens} in / {u.completion_tokens} out | "
             f"${costo:.6f} | RAG: {len(datos_llm)} resultados | caché: {cache_label}"
@@ -1377,6 +1418,16 @@ def _es_saludo(texto: str) -> bool:
     return re.sub(r"(.)\1{2,}", r"\1", limpio) in _SALUDOS
 
 
+def _formatear_nombre(user_name: str | None) -> str:
+    """Devuelve ' Nombre' o '' si el nombre es inválido/vacío/solo puntuación."""
+    if not user_name:
+        return ""
+    limpio = user_name.strip().strip(".-_,;:!?/\\")
+    if not limpio or len(limpio) < 2:
+        return ""
+    return f" {limpio}"
+
+
 # ══════════════════════════════════════════════════════════
 # MENSAJE DE BIENVENIDA (primer mensaje)              v4 NEW
 # ══════════════════════════════════════════════════════════
@@ -1395,10 +1446,57 @@ MENSAJE_BIENVENIDA = (
 )
 
 
-async def enviar_bienvenida_si_nuevo(user_id: str, update: Update) -> bool:
+def _mensaje_tiene_busqueda(texto: str) -> bool:
+    """
+    Detecta si un mensaje tiene intención de búsqueda además de un posible saludo.
+    Ej: "hola quiero pizza" → True, "hola" → False, "buenas, necesito un plomero" → True
+    """
+    limpio = normalizar_texto(texto)
+    # Quitar saludo del inicio para ver si queda algo con sustancia
+    for saludo in sorted(_SALUDOS, key=len, reverse=True):
+        s_norm = normalizar_texto(saludo)
+        if limpio.startswith(s_norm):
+            limpio = limpio[len(s_norm):].strip(" ,!.")
+            break
+
+    if not limpio or len(limpio) < 3:
+        return False
+
+    palabras = limpio.split()
+
+    # Tiene palabras que matchean sinónimos (exacto o prefijo) → búsqueda
+    for p in palabras:
+        if p in SINONIMOS:
+            return True
+        # Prefijo: "pizzerias" → matchea "pizza"
+        if len(p) >= 4:
+            for s in SINONIMOS:
+                if p.startswith(s) or s.startswith(p):
+                    return True
+
+    # Tiene palabras de intención de búsqueda
+    _INTENT = {
+        "quiero", "necesito", "busco", "buscando", "hay", "donde",
+        "cual", "alguna", "alguno", "recomienda", "recomendame",
+        "recomendas", "cerca", "abierta", "abierto", "urgente",
+        "conseguir", "encontrar", "preciso",
+    }
+    if any(p in _INTENT for p in palabras):
+        return True
+
+    # 3+ palabras después del saludo → probablemente una búsqueda
+    if len(palabras) >= 3:
+        return True
+
+    return False
+
+
+async def enviar_bienvenida_si_nuevo(user_id: str, update: Update, texto: str = "") -> bool:
     """
     Si es la primera vez del usuario, envía bienvenida + teclado.
-    Retorna True si envió la bienvenida (el caller sigue procesando el mensaje normal).
+    Si el mensaje tiene búsqueda (spec 1.4), NO envía bienvenida para que
+    la respuesta sea un solo mensaje con intro cálida + resultados.
+    Retorna True si envió la bienvenida.
     """
     if not es_usuario_nuevo(user_id):
         return False
@@ -1415,7 +1513,14 @@ async def enviar_bienvenida_si_nuevo(user_id: str, update: Update) -> bool:
         ],
     ]
 
-    nombre_fmt = f" {user_name}" if user_name else ""
+    if _mensaje_tiene_busqueda(texto):
+        # Spec 1.4: si ya pide algo, NO enviar bienvenida.
+        # Solo mandar el teclado silenciosamente, el LLM responde directo.
+        # Guardamos keyboard para enviarlo con la respuesta de búsqueda.
+        _keyboards_pendientes[user_id] = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        return False  # No se envió bienvenida → el flujo sigue procesando normalmente
+
+    nombre_fmt = _formatear_nombre(user_name)
     await responder_seguro(
         update.message,
         MENSAJE_BIENVENIDA.format(nombre=nombre_fmt),
@@ -1434,8 +1539,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     eliminar_historial(user_id)
     marcar_bienvenida(user_id)
 
+    nombre_fmt = _formatear_nombre(user_name)
     mensaje = (
-        f"¡Hola {user_name}! 👋 Soy *Vecinito* 🏘️\n\n"
+        f"¡Hola{nombre_fmt}! 👋 Soy *Vecinito* 🏘️\n\n"
         f"Tu guía de comercios y servicios en:\n"
         f"📍 City Bell  📍 Gonnet  📍 Villa Elisa\n\n"
         f"*Preguntame lo que necesites:*\n"
@@ -1539,15 +1645,15 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Bienvenida al primer mensaje (antes de todo)
-    # Envía la bienvenida y TAMBIÉN procesa el mensaje del usuario
-    bienvenida_enviada = await enviar_bienvenida_si_nuevo(user_id, update)
+    bienvenida_enviada = await enviar_bienvenida_si_nuevo(user_id, update, texto)
 
     # Saludo sin IA (solo si NO acabamos de enviar bienvenida, porque sería redundante)
     if not bienvenida_enviada and _es_saludo(texto):
         user_name = update.effective_user.first_name
+        nombre_fmt = _formatear_nombre(user_name)
         await responder_seguro(
             update.message,
-            f"¡Hola {user_name}! 👋 Soy *Vecinito* 🏘️\n\n"
+            f"Hola{nombre_fmt}! 👋 Soy *Vecinito* 🏘️\n\n"
             f"Tu asistente de barrio para encontrar comercios y servicios en "
             f"*City Bell*, *Gonnet* y *Villa Elisa*.\n\n"
             f"Preguntame lo que necesites:\n"
@@ -1559,13 +1665,36 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Si fue bienvenida + saludo, no hace falta procesar más
-    if bienvenida_enviada and _es_saludo(texto):
+    # Si fue bienvenida + saludo puro, no procesar más
+    if bienvenida_enviada and _es_saludo(texto) and not _mensaje_tiene_busqueda(texto):
         return
 
-    # Botones de zona
+    # Si fue bienvenida + búsqueda ("hola quiero pizza"), SEGUIR procesando
+
+    # FIX v5: Botones de zona se procesan INMEDIATO (sin debounce)
     if texto.startswith("🏘️"):
         texto = f"Qué comercios hay en {texto.replace('🏘️', '').strip()}?"
+        await registrar_busqueda(user_id, texto)
+        await update.message.chat.send_action(ChatAction.TYPING)
+        respuesta = await obtener_respuesta(user_id, texto, skip_log=True)
+        await responder_seguro(update.message, respuesta, disable_web_page_preview=True)
+        return
+
+    # FIX v5: Detectar frases de "te mando la ubicación" (no son búsquedas)
+    _norm = normalizar_texto(texto)
+    _FRASES_UBICACION = [
+        "te paso mi ubicacion", "te mando mi ubicacion", "te comparto mi ubicacion",
+        "ahi te mando la ubicacion", "ahi va mi ubicacion", "mando ubicacion",
+        "te mando el pin", "te paso la ubicacion", "le mando la ubicacion",
+        "te mando ubicacion", "paso ubicacion", "comparto ubicacion",
+        "ahi te paso la ubicacion", "ya te mando la ubicacion",
+    ]
+    if any(f in _norm for f in _FRASES_UBICACION):
+        await responder_seguro(
+            update.message,
+            "Dale, mandame el 📍 pin de ubicación y te busco lo más cercano!",
+        )
+        return
 
     await agregar_mensaje_a_cola(user_id, texto, update)
 
@@ -1587,7 +1716,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     logger.info(
-        f"Iniciando Vecinito v4 — modo: "
+        f"Iniciando Vecinito v5 — modo: "
         f"{'RAG (Supabase)' if supabase else 'JSON fallback'}"
     )
 
